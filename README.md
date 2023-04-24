@@ -45,6 +45,7 @@ The **firefox_profiles** is object with profile names als fields. For each profi
           privacy.trackingprotection.enabled: false
           signon.rememberSignons: false
           datareporting.healthreport.uploadEnabled: false
+        preferences_file: prefs
 
   roles:
     - staticdev.firefox

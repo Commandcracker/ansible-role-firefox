@@ -20,7 +20,7 @@
 
 - name: Install user prefs
   ansible.builtin.lineinfile:
-    path: "{{ create_profile.profile_path }}/prefs.js"
+    path: "{{ create_profile.profile_path }}/{{ firefox_profile.value.preferences_file | default('user') }}.js"
     create: true
     regexp: '^user_pref\("{{ pref.key }}",\s*\S+?\);\s*$'
     line: 'user_pref("{{ pref.key }}", {{ (''"%s"'' | format(pref.value)) if pref.value is string else (pref.value | lower) }});'
