@@ -1,91 +1,133 @@
 #!/usr/bin/python
 
-# TODO: agregar soporte para extensiones externas (url a archivo xpi)
-# TODO: instalar temas
+# TODO: add support for external extensions (url to xpi file)
+# TODO: install themes
 
-from ansible.module_utils.basic import *
-from tempfile import mkdtemp
-from zipfile import ZipFile
-from collections import OrderedDict
-import configparser
-import shutil
-import os
-import json
+# Built-in modules
+from json import loads
+from os import makedirs, remove
+from os.path import (
+    join,
+    basename,
+    dirname,
+    isfile
+)
+from urllib.request import urlopen
 from urllib.parse import urlparse
-import requests
+from shutil import move
+from tempfile import mkdtemp
+
+# External modules
+from ansible.module_utils.basic import AnsibleModule
+
+
+class DownloadError(Exception):
+    def __init__(self, slug: str, url: str, status_code: int) -> None:
+        self.message = (
+            f"Could not download {slug} from {url}. "
+            f"Status code: {status_code}"
+        )
+        super().__init__(self.message)
+
 
 class FirefoxExtension:
-    def __init__(self, slug, profile_path):
+    def __init__(self, slug: str, profile_path: str):
         self.slug = slug
         self.profile_path = profile_path
-        self._get_info()
-        self.download_path = os.path.join(mkdtemp(), self.filename)
-        self.destination = os.path.join(profile_path, 'extensions', '%s.xpi' % self.guid)
+        self.info: dict = None
+        self.id: str = None
+        self.guid: str = None
+        self.url: str = None
+        self.filename: str = None
+        self.download_path: str = None
+        self.destination: str = None
+        self._post_init__()
 
-    def _get_info(self):
-        url = 'https://services.addons.mozilla.org/api/v4/addons/addon/' + self.slug
-        r = requests.get(url)
-        if r.status_code != 200:
-            raise Exception('Could not download info for %s from %s' % (self.slug, url))
-        self.info = json.loads(r.content)
-        self.id = self.info['id']
-        self.guid = self.info['guid']
-        self.url = self.info['current_version']['files'][0]['url']
-        self.filename = os.path.basename(urlparse(self.url).path)
+    def _get_info(self) -> dict:
+        url = f"https://services.addons.mozilla.org/api/v4/addons/addon/{self.slug}"
+        with urlopen(url) as response:
+            if response.status != 200:
+                raise DownloadError(self.slug, url, response.status)
+            info = loads(response.read())
+        return info
+
+    def _post_init__(self):
+        self.info = self._get_info()
+        self.id = self.info.get("id")
+        self.guid = self.info["guid"]
+        self.url = self.info["current_version"]["files"][0]["url"]
+        self.filename = basename(urlparse(self.url).path)
+        self.download_path = join(mkdtemp(), self.filename)
+        self.destination = join(
+            self.profile_path,
+            "extensions",
+            f"{self.guid}.xpi"
+        )
 
     def _download(self):
-        r = requests.get(self.url, stream=True)
-        if r.status_code == 200:
-            with open(self.download_path, 'wb') as f:
-                for chunk in r:
-                    f.write(chunk)
+        response = urlopen(self.url)
+        if response.status != 200:
+            raise DownloadError(self.slug, self.url, response.status)
+        with open(self.download_path, "wb") as file:
+            while True:
+                chunk = response.read(1024)
+                if not chunk:
+                    break
+                file.write(chunk)
 
     def is_installed(self):
-        return os.path.isfile(self.destination)
+        return isfile(self.destination)
 
     def install(self):
-        path = os.path.dirname(self.destination)
-        try:
-            os.makedirs(path, 0o700)
-        except OSError:
-            if not os.path.isdir(path):
-                raise
+        makedirs(dirname(self.destination), mode=0o700, exist_ok=True)
         self._download()
-        shutil.move(self.download_path, self.destination)
+        move(self.download_path, self.destination)
 
     def uninstall(self):
-        os.remove(self.destination)
+        remove(self.destination)
 
 
-def main():
+def install_or_uninstall_addon(state: str, addon: FirefoxExtension) -> dict:
+    if state == "present" and not addon.is_installed():
+        addon.install()
+        return {
+            "changed": True,
+            "meta": {
+                "id": addon.id,
+                "url": addon.url,
+                "name": addon.filename
+            }
+        }
+
+    if state == "absent" and addon.is_installed():
+        addon.uninstall()
+        return {"changed": True}
+
+    return {"changed": False}
+
+
+def main() -> None:
     fields = {
-        'name': {'required': True, 'type': 'str'},
-        'profile_path': {'required': True, 'type': 'str'},
-        'state': {
-            'default': 'present',
-            'choices': ['present', 'absent'],
-            'type': 'str',
+        "name": {"required": True, "type": "str"},
+        "profile_path": {"required": True, "type": "str"},
+        "state": {
+            "default": "present",
+            "choices": ["present", "absent"],
+            "type": "str",
         },
     }
     module = AnsibleModule(argument_spec=fields)
-    profile_path = module.params['profile_path']
+    profile_path = module.params["profile_path"]
 
-    addon = FirefoxExtension(module.params['name'], profile_path)
-    changed = False
-    result = None
+    addon = FirefoxExtension(module.params["name"], profile_path)
+    state = module.params["state"]
 
     try:
-        if module.params['state'] == 'present' and not addon.is_installed():
-            addon.install()
-            changed = True
-            result = {'id': addon.id, 'url': addon.url, 'name': addon.filename}
-        elif module.params['state'] == 'absent' and addon.is_installed():
-            addon.uninstall()
-            changed = True
-        module.exit_json(changed=changed, meta=result)
-    except Exception as e:
-        module.fail_json(msg=str(e))
+        result = install_or_uninstall_addon(state, addon)
+        module.exit_json(**result)
+    except Exception as exception:
+        module.fail_json(msg=str(exception))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
